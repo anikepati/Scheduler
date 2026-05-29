@@ -6,7 +6,7 @@ Startup sequence:
   2. Connect DB pool + ensure schema exists
   3. Init HTTP client
   4. Start health server (liveness/readiness probes)
-  5. Start leader elector (only one pod wins the lock)
+  5. Start scheduler (all pods — optimistic locking, no leader election)
   6. Start worker loop (all pods execute jobs)
   7. Wait for SIGTERM / SIGINT
   8. Graceful shutdown in reverse order
@@ -21,7 +21,7 @@ import signal
 from logger import configure_logging, get_logger
 from storage import close_pool, create_schema, init_pool
 from runner import close_http_client, init_http_client
-from leader import LeaderElector
+from leader import Scheduler          # FIX: all pods schedule via optimistic locking
 from worker import Worker
 from health import HealthServer
 
@@ -41,12 +41,12 @@ async def main() -> None:
     await create_schema()
     await init_http_client()
 
-    leader = LeaderElector(pod_name=pod_name)
-    worker = Worker(pod_name=pod_name)
-    health = HealthServer(pod_name=pod_name, leader=leader, worker=worker)
+    scheduler = Scheduler(pod_name=pod_name)   # FIX: all pods run scheduler, no single leader
+    worker    = Worker(pod_name=pod_name)
+    health    = HealthServer(pod_name=pod_name, scheduler=scheduler, worker=worker)
 
     await health.start()
-    await leader.start()
+    await scheduler.start()
     await worker.start()
 
     log.info("scheduler_ready", pod=pod_name)
@@ -71,9 +71,9 @@ async def main() -> None:
     # -----------------------------------------------------------------------
     log.info("scheduler_shutting_down", pod=pod_name)
 
-    await worker.stop()      # drain in-flight jobs first
-    await leader.stop()      # release advisory lock
-    await health.stop()      # stop accepting probe requests
+    await worker.stop()       # drain in-flight jobs first
+    await scheduler.stop()    # stop scheduling + listener
+    await health.stop()       # stop accepting probe requests
     await close_http_client()
     await close_pool()
 

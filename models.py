@@ -17,22 +17,22 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 class AuthType(str, Enum):
-    NONE = "none"
-    BEARER = "bearer"
+    NONE    = "none"
+    BEARER  = "bearer"
     API_KEY = "api_key"
-    BASIC = "basic"
+    BASIC   = "basic"
 
 
 class JobStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
+    DONE    = "done"
+    FAILED  = "failed"
 
 
 class ExecutionStatus(str, Enum):
     SUCCESS = "success"
-    FAILED = "failed"
+    FAILED  = "failed"
     TIMEOUT = "timeout"
 
 
@@ -51,6 +51,8 @@ class ApiConfig(BaseModel):
     auth_secret_ref: Optional[str] = None
     payload_template: Optional[dict[str, Any]] = None
     timeout_seconds: int = 30
+    # FIX: cap response storage to prevent table bloat (default 64 KB)
+    max_response_bytes: int = 65536
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -59,11 +61,13 @@ class JobSchedule(BaseModel):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     api_config_id: uuid.UUID
     name: str
-    cron_expr: str                     # standard 5-field cron
+    cron_expr: str                  # standard 5-field cron
     enabled: bool = True
-    jitter_seconds: int = 0            # anti-thundering-herd spread
-    retry_attempts: int = 3
-    retry_backoff_sec: int = 5
+    jitter_seconds: int = 0         # anti-thundering-herd spread
+    retry_attempts: int = 3         # total queue-level attempts (not tenacity)
+    retry_backoff_sec: int = 5      # base seconds for exponential back-off
+    # FIX: used by optimistic locking to prevent duplicate enqueue across pods
+    last_enqueued_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

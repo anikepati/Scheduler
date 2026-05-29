@@ -1,13 +1,18 @@
 """
 JobRunner — executes a single API call for a claimed job.
-Handles auth header injection, retry with backoff, timeout,
-response parsing, and execution log writing.
+
+FIX: Metrics are now incremented on every execution outcome.
+FIX: Response body is capped at api_config.max_response_bytes before storage.
+FIX: Queue-level retry (schedule_retry) wires up the retry_attempts config;
+     tenacity handles quick network-error recovery (2 attempts inline),
+     queue retry handles the outer loop (retry_attempts total attempts).
 """
 
 from __future__ import annotations
 
+import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -20,15 +25,18 @@ from tenacity import (
 )
 
 import storage
+from health import increment_metric          # FIX: was imported but never called
 from logger import get_logger
 from models import ApiConfig, ExecutionStatus, JobExecutionLog, JobQueueItem, JobSchedule, JobStatus
 from secrets import build_auth_headers
 
 log = get_logger(__name__)
 
-# Shared async client — one per process, reused across all jobs.
-# Configured with reasonable enterprise defaults.
 _client: Optional[httpx.AsyncClient] = None
+
+# Quick inline retries for transient network errors only.
+# The outer retry loop (queue re-enqueue) is controlled by retry_attempts.
+_NETWORK_RETRY_ATTEMPTS = int(__import__("os").getenv("NETWORK_RETRY_ATTEMPTS", "2"))
 
 
 async def init_http_client() -> None:
@@ -69,22 +77,15 @@ async def execute_job(
     api_config: ApiConfig,
     pod_name: str,
 ) -> None:
-    """
-    Execute one job end-to-end:
-      1. Build request (headers, auth, payload)
-      2. Call API with retry
-      3. Write execution log
-      4. Update job_queue status
-    """
-    started_at = datetime.now(timezone.utc)
-    job_log_id = uuid.uuid4()
+    started_at  = datetime.now(timezone.utc)
+    job_log_id  = uuid.uuid4()
 
     log.info(
         "job_started",
         job_id=str(queue_item.id),
         schedule=schedule.name,
         url=api_config.url,
-        attempt=queue_item.attempts + 1,
+        attempt=queue_item.attempts,
     )
 
     http_status: Optional[int] = None
@@ -93,12 +94,9 @@ async def execute_job(
     exec_status = ExecutionStatus.FAILED
 
     try:
-        http_status, response_body = await _call_with_retry(
-            api_config=api_config,
-            max_attempts=schedule.retry_attempts,
-            backoff_sec=schedule.retry_backoff_sec,
-        )
+        http_status, response_body = await _call_with_retry(api_config)
         exec_status = ExecutionStatus.SUCCESS
+        increment_metric("jobs_succeeded_total")   # FIX
 
         log.info(
             "job_succeeded",
@@ -108,25 +106,30 @@ async def execute_job(
         )
 
     except httpx.TimeoutException as exc:
-        exec_status = ExecutionStatus.TIMEOUT
+        exec_status   = ExecutionStatus.TIMEOUT
         error_message = f"Timeout: {exc}"
+        increment_metric("jobs_timeout_total")     # FIX
         log.warning("job_timeout", job_id=str(queue_item.id), error=error_message)
 
     except RetryError as exc:
-        exec_status = ExecutionStatus.FAILED
-        error_message = f"All retries exhausted: {exc.last_attempt.exception()}"
-        log.error("job_retries_exhausted", job_id=str(queue_item.id), error=error_message)
+        exec_status   = ExecutionStatus.FAILED
+        error_message = f"Network retries exhausted: {exc.last_attempt.exception()}"
+        increment_metric("jobs_failed_total")      # FIX
+        log.error("job_network_retries_exhausted", job_id=str(queue_item.id), error=error_message)
 
     except Exception as exc:
-        exec_status = ExecutionStatus.FAILED
+        exec_status   = ExecutionStatus.FAILED
         error_message = str(exc)
+        increment_metric("jobs_failed_total")      # FIX
         log.exception("job_unexpected_error", job_id=str(queue_item.id), error=error_message)
 
     finally:
         finished_at = datetime.now(timezone.utc)
         duration_ms = int((finished_at - started_at).total_seconds() * 1000)
 
-        # Write immutable audit log regardless of outcome
+        # FIX: truncate response body before storing to prevent table bloat
+        safe_body = _truncate_response(response_body, api_config.max_response_bytes)
+
         await storage.insert_execution_log(
             JobExecutionLog(
                 id=job_log_id,
@@ -138,45 +141,60 @@ async def execute_job(
                 finished_at=finished_at,
                 status=exec_status,
                 http_status_code=http_status,
-                response_body=response_body,
+                response_body=safe_body,
                 error_message=error_message,
                 duration_ms=duration_ms,
             )
         )
 
-        # Update queue item status
+        # FIX: wire up queue-level retry (previously schedule_retry was dead code)
         if exec_status == ExecutionStatus.SUCCESS:
             await storage.complete_job(queue_item.id, JobStatus.DONE)
+
+        elif queue_item.attempts < schedule.retry_attempts:
+            # Exponential backoff: backoff_sec * 2^(attempt-1), capped at 1 hour
+            delay_sec = min(
+                schedule.retry_backoff_sec * (2 ** (queue_item.attempts - 1)),
+                3600,
+            )
+            retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay_sec)
+            await storage.schedule_retry(queue_item.id, retry_at)
+            log.info(
+                "job_requeued",
+                job_id=str(queue_item.id),
+                attempt=queue_item.attempts,
+                max_attempts=schedule.retry_attempts,
+                retry_in_sec=delay_sec,
+            )
+
         else:
             await storage.complete_job(queue_item.id, JobStatus.FAILED)
+            log.error(
+                "job_exhausted_all_attempts",
+                job_id=str(queue_item.id),
+                attempts=queue_item.attempts,
+            )
 
 
 # ---------------------------------------------------------------------------
-# HTTP call with tenacity retry
+# HTTP call — tenacity for transient network errors only
 # ---------------------------------------------------------------------------
 
-async def _call_with_retry(
-    api_config: ApiConfig,
-    max_attempts: int,
-    backoff_sec: int,
-) -> tuple[int, Any]:
+async def _call_with_retry(api_config: ApiConfig) -> tuple[int, Any]:
     """
-    Returns (http_status_code, parsed_response_body).
-    Retries on transient network errors and 5xx responses.
+    Inline retry for NETWORK errors only (connect timeout, DNS, TLS).
+    HTTP 5xx errors bubble up immediately — queue retry handles those.
     """
-
-    # Build auth headers at call time (not startup) so secret rotation works
-    auth_headers = build_auth_headers(
+    auth_headers   = build_auth_headers(
         auth_type=api_config.auth_type.value,
         secret_ref=api_config.auth_secret_ref,
     )
-
     merged_headers = {**api_config.headers, **auth_headers}
 
     @retry(
-        stop=stop_after_attempt(max_attempts),
-        wait=wait_exponential(multiplier=backoff_sec, min=backoff_sec, max=60),
-        retry=retry_if_exception_type((httpx.TransportError, _RetryableHTTPError)),
+        stop=stop_after_attempt(_NETWORK_RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(httpx.TransportError),
         reraise=True,
     )
     async def _attempt() -> tuple[int, Any]:
@@ -187,13 +205,6 @@ async def _call_with_retry(
             json=api_config.payload_template,
             timeout=api_config.timeout_seconds,
         )
-
-        if response.status_code >= 500:
-            raise _RetryableHTTPError(
-                f"HTTP {response.status_code} from {api_config.url}"
-            )
-
-        # Parse response — prefer JSON, fall back to text
         try:
             body = response.json()
         except Exception:
@@ -204,5 +215,27 @@ async def _call_with_retry(
     return await _attempt()
 
 
-class _RetryableHTTPError(Exception):
-    """Signals a 5xx response that should be retried."""
+# ---------------------------------------------------------------------------
+# FIX: Response body truncation — prevents unbounded storage growth
+# ---------------------------------------------------------------------------
+
+def _truncate_response(body: Any, max_bytes: int) -> Any:
+    """
+    If the serialised response exceeds max_bytes, replace with a sentinel
+    dict so the audit log row is still written but storage stays bounded.
+    """
+    if body is None:
+        return None
+
+    raw = json.dumps(body) if not isinstance(body, str) else body
+    size = len(raw.encode("utf-8"))
+
+    if size <= max_bytes:
+        return body
+
+    return {
+        "_truncated": True,
+        "original_size_bytes": size,
+        "max_bytes": max_bytes,
+        "preview": raw[:256],
+    }

@@ -1,5 +1,5 @@
 """
-Worker loop — runs on ALL pods (including the leader pod).
+Worker loop — runs on ALL pods.
 
 Continuously polls job_queue for pending jobs, claims them using
 SELECT FOR UPDATE SKIP LOCKED, and executes them with bounded
@@ -10,23 +10,29 @@ from __future__ import annotations
 
 import asyncio
 import os
+from time import monotonic
+from typing import Optional
 
 import storage
 from logger import get_logger
+from models import JobSchedule
 from runner import execute_job
 
 log = get_logger(__name__)
 
 WORKER_POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "5"))
-WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "20"))
-WORKER_BATCH_SIZE = int(os.getenv("WORKER_BATCH_SIZE", "10"))
+WORKER_CONCURRENCY   = int(os.getenv("WORKER_CONCURRENCY",  "20"))
+WORKER_BATCH_SIZE    = int(os.getenv("WORKER_BATCH_SIZE",   "10"))
+
+# FIX: TTL-based schedule cache — prevents serving stale configs indefinitely
+_CACHE_TTL_SECONDS = int(os.getenv("SCHEDULE_CACHE_TTL_SECONDS", "300"))
 
 
 class Worker:
     def __init__(self, pod_name: str) -> None:
         self.pod_name = pod_name
-        self._semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
-        self._stop_event = asyncio.Event()
+        self._semaphore   = asyncio.Semaphore(WORKER_CONCURRENCY)
+        self._stop_event  = asyncio.Event()
         self._worker_task: asyncio.Task | None = None
         self._active_tasks: set[asyncio.Task] = set()
 
@@ -94,7 +100,6 @@ class Worker:
         """
         async with self._semaphore:
             try:
-                # Fetch schedule + api_config for this job
                 schedule = await _get_schedule(queue_item.job_schedule_id)
                 if not schedule:
                     log.error(
@@ -102,10 +107,7 @@ class Worker:
                         job_id=str(queue_item.id),
                         schedule_id=str(queue_item.job_schedule_id),
                     )
-                    await storage.complete_job(
-                        queue_item.id,
-                        storage.JobStatus.FAILED,
-                    )
+                    await storage.complete_job(queue_item.id, storage.JobStatus.FAILED)
                     return
 
                 api_config = await storage.get_api_config(schedule.api_config_id)
@@ -115,10 +117,7 @@ class Worker:
                         job_id=str(queue_item.id),
                         api_config_id=str(schedule.api_config_id),
                     )
-                    await storage.complete_job(
-                        queue_item.id,
-                        storage.JobStatus.FAILED,
-                    )
+                    await storage.complete_job(queue_item.id, storage.JobStatus.FAILED)
                     return
 
                 await execute_job(
@@ -137,25 +136,32 @@ class Worker:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers with simple in-process cache
+# FIX: TTL-based in-process schedule cache
+# Replaces infinite dict that never invalidated stale configs.
+# _CACHE_TTL_SECONDS controls how quickly config changes propagate.
 # ---------------------------------------------------------------------------
 
-_schedule_cache: dict = {}
-_api_config_cache: dict = {}
+# id → (JobSchedule, cached_at_monotonic)
+_schedule_cache: dict[object, tuple[JobSchedule, float]] = {}
 
 
-async def _get_schedule(schedule_id):
-    """
-    Lightweight in-process cache for schedule rows.
-    Cache is invalidated implicitly — worst case one stale execution.
-    For production, add TTL if schedule churn is high.
-    """
-    if schedule_id not in _schedule_cache:
-        async with storage.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM job_schedules WHERE id = $1", schedule_id
-            )
-        if row:
-            from models import JobSchedule
-            _schedule_cache[schedule_id] = storage._row_to_job_schedule(row)
-    return _schedule_cache.get(schedule_id)
+async def _get_schedule(schedule_id) -> Optional[JobSchedule]:
+    entry = _schedule_cache.get(schedule_id)
+    if entry is not None:
+        sched, cached_at = entry
+        if (monotonic() - cached_at) < _CACHE_TTL_SECONDS:
+            return sched
+        # TTL expired — remove stale entry and re-fetch
+        del _schedule_cache[schedule_id]
+
+    async with storage.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM job_schedules WHERE id = $1", schedule_id
+        )
+
+    if row:
+        fresh = storage._row_to_job_schedule(row)
+        _schedule_cache[schedule_id] = (fresh, monotonic())
+        return fresh
+
+    return None
