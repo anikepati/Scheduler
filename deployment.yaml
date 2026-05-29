@@ -1,0 +1,134 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: scheduler-secrets
+  namespace: scheduler
+type: Opaque
+stringData:
+  POSTGRES_DSN: "postgresql://user:password@postgres-host:5432/scheduler_db"
+  # Add your API credential env vars here, e.g.:
+  # MY_API_BEARER_TOKEN: "your-token-here"
+  # ANOTHER_API_KEY: "Header-Name:key-value"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: scheduler
+data:
+  LOG_LEVEL: "INFO"
+  SCHEDULE_TICK_SECONDS: "60"
+  LOOKAHEAD_SECONDS: "120"
+  STALE_JOB_TIMEOUT_SECONDS: "300"
+  WORKER_CONCURRENCY: "20"
+  WORKER_BATCH_SIZE: "10"
+  WORKER_POLL_INTERVAL_SECONDS: "5"
+  HEALTH_PORT: "8080"
+  DB_POOL_MIN: "2"
+  DB_POOL_MAX: "10"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: scheduler
+  labels:
+    app: scheduler
+spec:
+  replicas: 4          # One per OCP cluster — all compete for leader lock
+  selector:
+    matchLabels:
+      app: scheduler
+  template:
+    metadata:
+      labels:
+        app: scheduler
+    spec:
+      terminationGracePeriodSeconds: 60   # Allow drain of in-flight jobs
+
+      containers:
+        - name: scheduler
+          image: your-registry/scheduler:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: health
+
+          # Inject POD_NAME via downward API — used as worker identity in DB
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          envFrom:
+            - secretRef:
+                name: scheduler-secrets
+            - configMapRef:
+                name: scheduler-config
+
+          # OCP liveness probe — restarts pod if process hangs
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+
+          # OCP readiness probe — removes pod from load balancer if DB unreachable
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # OCP requires non-root
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheduler
+  namespace: scheduler
+spec:
+  selector:
+    app: scheduler
+  ports:
+    - name: health
+      port: 8080
+      targetPort: 8080
+
+---
+# Optional: expose /metrics to Prometheus via ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: scheduler
+  namespace: scheduler
+spec:
+  selector:
+    matchLabels:
+      app: scheduler
+  endpoints:
+    - port: health
+      path: /metrics
+      interval: 30s
